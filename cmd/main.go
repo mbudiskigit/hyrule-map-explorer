@@ -2,6 +2,7 @@ package main
 
 import (
 	"image"
+	"image/color"
 	_ "image/jpeg"
 	_ "image/png"
 	"log"
@@ -9,6 +10,8 @@ import (
 	"os"
 
 	"github.com/hajimehoshi/ebiten/v2"
+	"github.com/hajimehoshi/ebiten/v2/audio"
+	"github.com/hajimehoshi/ebiten/v2/audio/mp3"
 )
 
 type Game struct {
@@ -22,6 +25,9 @@ type Game struct {
 	// player sprite and size
 	playerSprite     *ebiten.Image
 	playerW, playerH int
+	// audio
+	audioContext *audio.Context
+	audioPlayer  *audio.Player
 }
 
 func loadImage(path string) (*ebiten.Image, error) {
@@ -38,6 +44,12 @@ func loadImage(path string) (*ebiten.Image, error) {
 }
 
 func (g *Game) Update() error {
+	// check if audio player has finished and restart for loop
+	if g.audioPlayer != nil && !g.audioPlayer.IsPlaying() {
+		g.audioPlayer.Rewind()
+		g.audioPlayer.Play()
+	}
+
 	// allow basic arrow-key panning between tiles
 	// move tile indices when arrow keys are pressed
 	const moveDelta = 1
@@ -70,17 +82,29 @@ func (g *Game) Update() error {
 	// clamp player to image bounds
 	if g.bg != nil {
 		bw, bh := g.bg.Bounds().Dx(), g.bg.Bounds().Dy()
+		// clamp player position so it doesn't go outside background
+		// player bounds: (px, py) to (px + playerW, py + playerH)
 		if g.px < 0 {
 			g.px = 0
 		}
 		if g.py < 0 {
 			g.py = 0
 		}
-		if g.px > float64(bw-g.playerW) {
-			g.px = float64(bw - g.playerW)
+		// ensure player's right edge doesn't exceed background's right edge
+		maxPx := float64(bw - g.playerW)
+		if maxPx < 0 {
+			maxPx = 0
 		}
-		if g.py > float64(bh-g.playerH) {
-			g.py = float64(bh - g.playerH)
+		if g.px > maxPx {
+			g.px = maxPx
+		}
+		// ensure player's bottom edge doesn't exceed background's bottom edge
+		maxPy := float64(bh - g.playerH)
+		if maxPy < 0 {
+			maxPy = 0
+		}
+		if g.py > maxPy {
+			g.py = maxPy
 		}
 		// compute scale for current viewport
 		vw := g.tileW
@@ -137,12 +161,50 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	screen.DrawImage(g.bg, op)
 
-	// draw player sprite
-	// convert player world position to screen position
+	// draw shadow (ellipse beneath the player)
+	shadowWidth := int(float64(g.playerW) * 0.8)
+	shadowHeight := int(float64(g.playerH) * 0.3)
+	shadowOffsetY := float64(g.playerH) * 2.1 // offset below player
+
+	// create shadow image with rounded corners (ellipse effect)
+	shadowImg := ebiten.NewImage(shadowWidth, shadowHeight)
+	// fill with semi-transparent black
+	shadowImg.Fill(color.RGBA{R: 0, G: 0, B: 0, A: 100})
+
+	// draw rounded corners by clearing corner regions
+	cornerRadius := int(float64(shadowHeight) / 2)
+	for x := 0; x < cornerRadius; x++ {
+		for y := 0; y < cornerRadius; y++ {
+			dx := x - cornerRadius
+			dy := y - cornerRadius
+			if dx*dx+dy*dy > cornerRadius*cornerRadius {
+				// clear top-left corner
+				shadowImg.Set(x, y, color.RGBA{0, 0, 0, 0})
+				// clear top-right corner
+				shadowImg.Set(shadowWidth-1-x, y, color.RGBA{0, 0, 0, 0})
+				// clear bottom-left corner
+				shadowImg.Set(x, shadowHeight-1-y, color.RGBA{0, 0, 0, 0})
+				// clear bottom-right corner
+				shadowImg.Set(shadowWidth-1-x, shadowHeight-1-y, color.RGBA{0, 0, 0, 0})
+			}
+		}
+	}
+
+	// draw shadow
 	playerScreenX := (g.px-float64(g.vx))*scale + dx
 	playerScreenY := (g.py-float64(g.vy))*scale + dy
 
-	// draw player sprite (already resized, scale for viewport)
+	shadowOp := &ebiten.DrawImageOptions{}
+	shadowOp.GeoM.Scale(scale, scale)
+	shadowOp.GeoM.Translate(
+		playerScreenX+float64(g.playerW-shadowWidth)/2*scale,
+		playerScreenY+shadowOffsetY*scale,
+	)
+	shadowOp.ColorScale.ScaleAlpha(0.9)
+	screen.DrawImage(shadowImg, shadowOp)
+
+	// draw player sprite
+	// convert player world position to screen position
 	playerOp := &ebiten.DrawImageOptions{}
 	playerOp.GeoM.Scale(scale, scale)
 	playerOp.GeoM.Translate(playerScreenX, playerScreenY)
@@ -221,6 +283,29 @@ func main() {
 	playerX := float64((tileW / 2) - (playerW / 2))
 	playerY := float64((tileH / 2) - (playerH / 2))
 	g := &Game{bg: bg, vx: 0, vy: 0, tileW: tileW, tileH: tileH, px: playerX, py: playerY, playerSprite: playerSprite, playerW: playerW, playerH: playerH}
+
+	// load and play background music
+	audioContext := audio.NewContext(48000)
+	musicPath := "assets/kakariko-village.mp3"
+	musicFile, err := os.Open(musicPath)
+	if err != nil {
+		log.Printf("warning: failed to load music %s: %v", musicPath, err)
+	} else {
+		defer musicFile.Close()
+		decoded, err := mp3.DecodeWithSampleRate(audioContext.SampleRate(), musicFile)
+		if err != nil {
+			log.Printf("warning: failed to decode music %s: %v", musicPath, err)
+		} else {
+			player, err := audioContext.NewPlayer(decoded)
+			if err != nil {
+				log.Printf("warning: failed to create audio player: %v", err)
+			} else {
+				player.Play()
+				g.audioContext = audioContext
+				g.audioPlayer = player
+			}
+		}
+	}
 
 	// start in fullscreen mode
 	// ebiten.SetFullscreen(true)
